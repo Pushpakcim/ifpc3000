@@ -1,0 +1,1010 @@
+# System Architecture Documentation
+
+## Overview
+
+This document describes the architecture for the EC200U LTE Module and its integration with a cloud server using MQTT protocol. The system is modular, with an entry point that spawns dedicated tasks for various subsystems.
+
+---
+
+## Architecture Diagram
+ 
+
+
+## Component Explanation
+
+### Cloud Server
+
+- **Host:** 14.102.161.101
+- **Port/Protocol:** 1883 (MQTT)
+- The server exchanges data with the EC200U LTE module via MQTT publish/subscribe.
+
+### EC200U LTE Module
+
+- **Entry Point:** `ql_init.c > appimg_enter()`
+    - The main entry that hands over initialization to `ql_init_demo_thread()`.
+
+- **Main Thread:**  
+    - `ql_init_demo_thread()` is responsible for initializing and spawning all specific application tasks.
+
+- **Subsystem Tasks:**  
+    - **MQTT Task:** Manages the MQTT client communication with the cloud.  
+    - **GPIO Task:** Handles general purpose I/O operations, e.g., controlling street lights.
+    - **I2C Task:** Handles I2C communication, e.g., for RTC and LCD.
+    - **RS485 Task:** Communicates with external devices like the energy meter over RS485.
+    - **SPI Flash Task:** Manages the SPI Flash, used for data logging and storage.
+
+- **Subsystem Functionalities:**  
+    - **Cloud Comm:** Interfaces with the server for data exchange.
+    - **Street Lights:** Controls and monitors street light systems.
+    - **RTC + LCD:** Manages real-time clock and LCD display.
+    - **Energy Meter:** Reads and transmits energy meter data.
+    - **Data Log:** Handles logging of data to SPI Flash for future reference or backup.
+
+---
+
+## Data Flow Summary
+
+1. **Cloud Communication:**  
+   - Data is exchanged between the EC200U module and the cloud server via MQTT.
+2. **Initialization:**  
+   - On start, `ql_init.c` triggers the setup of system threads in `ql_init_demo_thread()`.
+3. **Modular Tasks:**  
+   - Each I/O method or major function (MQTT, GPIO, I2C, RS485, SPI) gets its own task, ensuring modular and concurrent operation.
+4. **Subsystem Execution:**  
+   - Each task can independently interact with its respective hardware or protocol endpoint and update/report to the cloud as configured.
+
+---
+
+## Notes
+
+- The design allows for extensibility—new hardware modules and software features can be integrated by adding new tasks.
+- Error handling, task monitoring, and inter-task communication details should be designed based on project requirements.
+
+
+
+ 
+
+1. Entry Point: ql_init.c
+File: ql_init.c
+int appimg_enter(void *param)
+{
+    // Step 1: Initialize C++ global constructors
+    prvInvokeGlobalCtors();
+    
+    // Step 2: Configure watchdog based on build type
+    #ifdef QL_APP_FEATURE_RELEASE
+        ql_dev_cfg_wdt(1);      // Enable watchdog in release
+    #else
+        ql_dev_cfg_wdt(0);      // Disable in debug
+    #endif
+    
+    // Step 3: Initialize all GPIO pins from pin configuration table
+    ql_pin_cfg_init();
+    
+    // Step 4: Create main initialization task
+    ql_task_t init_task = NULL;
+    ql_rtos_task_create(&init_task, 
+                        4096,           // Stack size
+                        APP_PRIORITY_NORMAL,
+                        "ql_init",      // Task name
+                        ql_init_demo_thread,
+                        NULL);
+    
+    return 0;
+}
+
+Pin Configuration Function:
+void ql_pin_cfg_init(void)
+{
+    // Iterates through ql_pin_cfg table defined in ql_pin_cfg.h
+    for(index = 0; index < QL_GPIO_PIN_MAX; index++)
+    {
+        // Get pin configuration from table
+        pin_num      = ql_pin_cfg[index].pin_num;
+        default_func = ql_pin_cfg[index].default_func;
+        gpio_func    = ql_pin_cfg[index].gpio_func;
+        gpio_num     = ql_pin_cfg[index].gpio_num;
+        gpio_dir     = ql_pin_cfg[index].gpio_dir;
+        gpio_pull    = ql_pin_cfg[index].gpio_pull;
+        gpio_lvl     = ql_pin_cfg[index].gpio_lvl;
+        
+        // Configure each pin based on function
+        if(default_func != gpio_func)
+        {
+            ql_pin_set_func(pin_num, gpio_func);
+        }
+        
+        if(gpio_dir == GPIO_OUTPUT)
+        {
+            ql_gpio_set_direction(gpio_num, GPIO_OUTPUT);
+            ql_gpio_set_level(gpio_num, gpio_lvl);
+        }
+        else
+        {
+            ql_gpio_set_direction(gpio_num, GPIO_INPUT);
+            ql_gpio_set_pull(gpio_num, gpio_pull);
+        }
+    }
+}
+
+2. Main Initialization Thread
+File: ql_init.c
+static void ql_init_demo_thread(void *param)
+{
+    QL_INIT_LOG("init demo thread enter, param 0x%x", param);
+
+    // ═══════════════════════════════════════════════════════════════
+    // PHASE 1: HARDWARE PERIPHERALS INITIALIZATION
+    // ═══════════════════════════════════════════════════════════════
+    
+    // 1.1 I2C Bus + RTC + LCD Display
+    ql_i2c_RTC_LCD_init();      // → I2C_RTC_LCD.c
+    
+    // 1.2 LED Status Indicators
+    ql_ledcfg_app_init();       // → led_cfg_demo.c
+    
+    // 1.3 Digital Input/Output for Street Light Relays
+    ql_gpio_app_dido_init();    // → gpio_DIDO.c
+    
+    // 1.4 Physical Key/Button Interrupts
+    ql_gpioint_app_key_init(); // → gpio_int_KEY.c
+
+    // ═══════════════════════════════════════════════════════════════
+    // PHASE 2: NETWORK & COMMUNICATION
+    // ═══════════════════════════════════════════════════════════════
+    
+    // 2.1 Network Registration (SIM card, signal)
+    ql_nw_app_init();           // → nw_demo.c
+    
+    // 2.2 Data Call (PDP context activation)
+    ql_datacall_app_init();     // → datacall_demo.c
+    
+    // 2.3 Power Management
+    ql_power_app_init();        // → power_demo.c
+
+    // ═══════════════════════════════════════════════════════════════
+    // PHASE 3: APPLICATION LAYER (Conditional)
+    // ═══════════════════════════════════════════════════════════════
+    
+    #ifdef QL_APP_FEATURE_MQTT
+        ql_mqtt_app_init();     // → mqtt_demo.c (MAIN APPLICATION)
+    #endif
+    
+    // Task stays alive for any cleanup/monitoring
+    while(1)
+    {
+        ql_rtos_task_sleep_ms(1000);
+    }
+}
+
+3. Configuration Management System
+File: configuration.h
+Memory Layout in External Flash:
+┌─────────────────────────────────────────────────────────────────┐
+│  EXTERNAL SPI FLASH (AT25FF series) - 4MB                       │
+├─────────────────────────────────────────────────────────────────┤
+│  0x00000000 - 0x00001FFF  │  EPROM_General (8KB)               │
+│                           │  - RTU Details                      │
+│                           │  - Customer Details                 │
+│                           │  - DI/DO Configuration              │
+│                           │  - MQTT Settings                    │
+│                           │  - DO Mode (Manual/Auto/Astro)      │
+├─────────────────────────────────────────────────────────────────┤
+│  0x00002000 - 0x00003FFF  │  EPROM_Schedule (8KB)              │
+│                           │  - 85 Schedule Entries              │
+│                           │  - Start/Stop Times                 │
+├─────────────────────────────────────────────────────────────────┤
+│  0x00004000 - 0x00005FFF  │  EPROM_PermanentData (8KB)         │
+│                           │  - Hardware Version                 │
+│                           │  - Device ID (Unique)               │
+├─────────────────────────────────────────────────────────────────┤
+│  0x0000F000 - 0x003F0FFF  │  History Data (3.9MB)              │
+│                           │  - Max 3000 packets                 │
+│                           │  - Logged meter readings            │
+├─────────────────────────────────────────────────────────────────┤
+│  0x003FF000 - 0x003FFFFF  │  Runtime Parameters (4KB)          │
+│                           │  - Current state                    │
+│                           │  - Last operation                   │
+└─────────────────────────────────────────────────────────────────┘
+
+Main Configuration Structure:
+struct Save_Para_General
+{
+    // ─────────────────────────────────────────────────────────
+    // HEADER (Integrity Check)
+    // ─────────────────────────────────────────────────────────
+    unsigned char checkbyte;           // Magic byte (e.g., 0xAA)
+    unsigned char ChecksumOfStuct;     // CRC/Checksum
+    uint16_t SizeOfStuct;              // Structure size for versioning
+    
+    // ─────────────────────────────────────────────────────────
+    // DEVICE SETTINGS
+    // ─────────────────────────────────────────────────────────
+    uint8_t MeterMake;                 // Meter manufacturer
+    uint8_t NoofCkt;                   // Number of circuits
+    uint16_t MaxofSMS;                 // SMS limit
+    uint16_t SMSSend_Exceed;           // SMS overflow counter
+    uint16_t DailySMS;                 // Daily SMS count
+    uint8_t flashOTA;                  // OTA update flag
+    unsigned int rebootCount;          // Reboot counter
+    unsigned int LogRate;              // Data logging rate (seconds)
+    
+    // ─────────────────────────────────────────────────────────
+    // SUB-STRUCTURES
+    // ─────────────────────────────────────────────────────────
+    struct RtuDetails Rtu_Detail;           // RTU ID, versions
+    struct CustDetails Cust_Detail;         // Site name, GPS, timezone
+    struct AIDIDODetails AI_DI_DO_Detail;   // DI/DO states
+    struct ECommunication E_Comm;           // Ethernet (if used)
+    struct ModemCommunication Mo_Comm;      // MQTT broker settings
+    struct BLE_Details bleDetails;          // Bluetooth
+    struct GPS_Details gpsDetails;          // GPS polling
+    struct SD_Card_Details sdCardDetails;   // SD card
+    struct DO_Mode_Details DoModeDetails;   // ★ STREET LIGHT MODE ★
+    
+    // ─────────────────────────────────────────────────────────
+    // ADVANCED FEATURES
+    // ─────────────────────────────────────────────────────────
+    struct setpoint sp;                // Alarm setpoints
+    uint8_t mIsInterlockEnable;        // Safety interlock
+    uint8_t mIsDiInterlockEnable;      // DI-based interlock
+};
+
+DO (Digital Output) Modes - Street Light Control:
+typedef enum
+{
+    RTU_DO_MODE_MANUAL          = 0,   // Manual ON/OFF from cloud/local
+    RTU_DO_MODE_PHOTO           = 1,   // Light sensor based
+    RTU_DO_MODE_AUTO            = 2,   // Time-based schedule
+    RTU_DO_MODE_ASTROTIME_GEO   = 3,   // Sunrise/Sunset calculation
+    RTU_DO_MODE_TWILIGHT_GEO    = 4,   // Civil/Nautical twilight
+    RTU_DO_MODE_LOCAL           = 5    // Local schedule override
+} RtuDoMode_e;
+
+struct DO_Mode_Details
+{
+    RtuDoMode_e Do_Mode;        // Current active mode
+    char DO_Value[35];          // DO state string
+    RtuDoMode_e Do_Mode_temp;   // Temporary mode during transition
+};
+
+4. GPIO Digital Input/Output Control
+File: gpio_DIDO.c
+// ═══════════════════════════════════════════════════════════════════
+// GPIO PIN DEFINITIONS (from ql_pin_cfg.h)
+// ═══════════════════════════════════════════════════════════════════
+// Digital Outputs (Relay Control):
+//   DO_0 → Street Light Zone 1
+//   DO_1 → Street Light Zone 2
+//   DO_2 → Street Light Zone 3
+//
+// Digital Inputs (Status Monitoring):
+//   DI_0 to DI_5 → Feedback/Status signals
+
+static ql_task_t gpio_dido_task = NULL;
+
+void ql_gpio_app_dido_init(void)
+{
+    // Create DIDO monitoring task
+    ql_rtos_task_create(&gpio_dido_task,
+                        4096,
+                        APP_PRIORITY_NORMAL,
+                        "gpio_dido",
+                        gpio_dido_thread,
+                        NULL);
+}
+
+static void gpio_dido_thread(void *param)
+{
+    // Initialize GPIO directions
+    init_digital_outputs();
+    init_digital_inputs();
+    
+    while(1)
+    {
+        // ─────────────────────────────────────────────────────
+        // READ DIGITAL INPUTS (Status Feedback)
+        // ─────────────────────────────────────────────────────
+        for(int i = 0; i < MAX_DI_CHANNEL; i++)  // MAX_DI_CHANNEL = 6
+        {
+            ql_gpio_get_level(DI_GPIO[i], &level);
+            EPROM_General.AI_DI_DO_Detail.dig_bit_array[i] = level;
+            
+            // Detect state change
+            if(level != EPROM_General.AI_DI_DO_Detail.Old_dig_bit_array[i])
+            {
+                // Trigger event notification
+                flag_DI_Changed = 1;
+                EPROM_General.AI_DI_DO_Detail.Old_dig_bit_array[i] = level;
+            }
+        }
+        
+        // ─────────────────────────────────────────────────────
+        // CONTROL DIGITAL OUTPUTS (Street Light Relays)
+        // ─────────────────────────────────────────────────────
+        for(int i = 0; i < MAX_DO_CHANNEL; i++)  // MAX_DO_CHANNEL = 3
+        {
+            uint8_t desired_state = EPROM_General.AI_DI_DO_Detail.DOSignal[i];
+            
+            // Apply output
+            ql_gpio_set_level(DO_GPIO[i], desired_state);
+            
+            // Track changes for cloud sync
+            if(desired_state != EPROM_General.AI_DI_DO_Detail.OLDDOSignal[i])
+            {
+                flag_DO_Changed = 1;
+                EPROM_General.AI_DI_DO_Detail.OLDDOSignal[i] = desired_state;
+            }
+        }
+        
+        ql_rtos_task_sleep_ms(100);  // 100ms polling
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// DO CONTROL FUNCTIONS (Called by MQTT/Schedule/Astro handlers)
+// ═══════════════════════════════════════════════════════════════════
+
+void set_digital_output(uint8_t channel, uint8_t state)
+{
+    if(channel < MAX_DO_CHANNEL)
+    {
+        EPROM_General.AI_DI_DO_Detail.DOSignal[channel] = state;
+        flag_flashUpdateEPROM_General = 1;  // Mark for flash save
+    }
+}
+
+void set_all_outputs(uint8_t state)
+{
+    for(int i = 0; i < MAX_DO_CHANNEL; i++)
+    {
+        EPROM_General.AI_DI_DO_Detail.DOSignal[i] = state;
+    }
+    flag_flashUpdateEPROM_General = 1;
+}
+
+5. MQTT Communication - Cloud Connectivity
+File: mqtt_demo.c
+// ═══════════════════════════════════════════════════════════════════
+// MQTT CLIENT STATE MACHINE
+// ═══════════════════════════════════════════════════════════════════
+
+typedef enum {
+    MQTT_STATE_IDLE,
+    MQTT_STATE_WAIT_NETWORK,
+    MQTT_STATE_WAIT_DATACALL,
+    MQTT_STATE_CONNECTING,
+    MQTT_STATE_CONNECTED,
+    MQTT_STATE_SUBSCRIBING,
+    MQTT_STATE_RUNNING,
+    MQTT_STATE_DISCONNECTED,
+    MQTT_STATE_ERROR
+} mqtt_state_e;
+
+static mqtt_state_e mqtt_state = MQTT_STATE_IDLE;
+static ql_task_t mqtt_task = NULL;
+
+void ql_mqtt_app_init(void)
+{
+    ql_rtos_task_create(&mqtt_task,
+                        8192,           // Larger stack for JSON processing
+                        APP_PRIORITY_NORMAL,
+                        "mqtt_client",
+                        mqtt_client_thread,
+                        NULL);
+}
+
+static void mqtt_client_thread(void *param)
+{
+    int ret;
+    mqtt_client_t *client = NULL;
+    
+    // ─────────────────────────────────────────────────────────
+    // PHASE 1: WAIT FOR NETWORK REGISTRATION
+    // ─────────────────────────────────────────────────────────
+    mqtt_state = MQTT_STATE_WAIT_NETWORK;
+    
+    while(1)
+    {
+        ql_nw_get_reg_status(&nw_status);
+        if(nw_status == QL_NW_REG_STATE_HOME_NETWORK ||
+           nw_status == QL_NW_REG_STATE_ROAMING)
+        {
+            break;  // Network registered
+        }
+        ql_rtos_task_sleep_s(2);
+    }
+    
+    // ─────────────────────────────────────────────────────────
+    // PHASE 2: ACTIVATE DATA CALL (PDP Context)
+    // ─────────────────────────────────────────────────────────
+    mqtt_state = MQTT_STATE_WAIT_DATACALL;
+    
+    ql_datacall_cfg_t cfg = {
+        .profile_idx = 1,
+        .apn = EPROM_General.Mo_Comm.Mo_APN,
+        .auth_type = 0,
+    };
+    
+    ret = ql_datacall_start(cfg.profile_idx, &cfg);
+    if(ret != QL_DATACALL_SUCCESS)
+    {
+        // Retry logic...
+    }
+    
+    // ─────────────────────────────────────────────────────────
+    // PHASE 3: CONNECT TO MQTT BROKER
+    // ─────────────────────────────────────────────────────────
+    mqtt_state = MQTT_STATE_CONNECTING;
+    
+    mqtt_client_config_t mqtt_cfg = {
+        .broker_ip   = EPROM_General.Mo_Comm.MQTT_Conn.MQTT_Bro_IP,
+        .broker_port = EPROM_General.Mo_Comm.MQTT_Conn.MQTT_Bro_Port,
+        .client_id   = EPROM_General.Mo_Comm.MQTT_Conn.MQTT_Cli_Id,
+        .username    = EPROM_General.Mo_Comm.MQTT_Conn.MQTT_Us_Name,
+        .password    = EPROM_General.Mo_Comm.MQTT_Conn.MQTT_Us_Pass,
+        .keepalive   = EPROM_General.Mo_Comm.MQTT_LiveFreq,
+        .clean_session = 1,
+    };
+    
+    client = mqtt_client_new(&mqtt_cfg);
+    ret = mqtt_client_connect(client);
+    
+    // ─────────────────────────────────────────────────────────
+    // PHASE 4: SUBSCRIBE TO COMMAND TOPIC
+    // ─────────────────────────────────────────────────────────
+    mqtt_state = MQTT_STATE_SUBSCRIBING;
+    
+    mqtt_client_subscribe(client, 
+                         EPROM_General.Mo_Comm.MQTT_Conn.MQTT_Sub_Topic,
+                         QOS_1,
+                         mqtt_message_callback);
+    
+    mqtt_state = MQTT_STATE_RUNNING;
+    
+    // ─────────────────────────────────────────────────────────
+    // PHASE 5: MAIN LOOP - Publish & Process
+    // ─────────────────────────────────────────────────────────
+    uint32_t last_publish_time = 0;
+    uint32_t publish_interval = EPROM_General.LogRate * 1000;
+    
+    while(1)
+    {
+        // Handle incoming messages (non-blocking)
+        mqtt_client_yield(client, 100);
+        
+        // Periodic data publishing
+        if(get_tick_ms() - last_publish_time >= publish_interval)
+        {
+            publish_telemetry_data(client);
+            last_publish_time = get_tick_ms();
+        }
+        
+        // Publish on DO/DI state change
+        if(flag_DO_Changed || flag_DI_Changed)
+        {
+            publish_status_update(client);
+            flag_DO_Changed = 0;
+            flag_DI_Changed = 0;
+        }
+        
+        ql_rtos_task_sleep_ms(100);
+    }
+}
+
+MQTT Message Handler:
+static void mqtt_message_callback(mqtt_client_t *client, 
+                                  const char *topic, 
+                                  const char *payload, 
+                                  int payload_len)
+{
+    QL_MQTT_LOG("Received on topic: %s", topic);
+    
+    // Parse JSON command using cJSON
+    cJSON *root = cJSON_Parse(payload);
+    if(root == NULL)
+    {
+        QL_MQTT_LOG("JSON parse error");
+        return;
+    }
+    
+    // ─────────────────────────────────────────────────────────
+    // COMMAND: DO Control (Street Light ON/OFF)
+    // ─────────────────────────────────────────────────────────
+    cJSON *cmd = cJSON_GetObjectItem(root, "cmd");
+    if(cmd && strcmp(cmd->valuestring, "DO_CONTROL") == 0)
+    {
+        cJSON *channel = cJSON_GetObjectItem(root, "channel");
+        cJSON *state = cJSON_GetObjectItem(root, "state");
+        
+        if(channel && state)
+        {
+            set_digital_output(channel->valueint, state->valueint);
+            
+            // Send acknowledgment
+            publish_ack(client, "DO_CONTROL", "SUCCESS");
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────
+    // COMMAND: Change DO Mode
+    // ─────────────────────────────────────────────────────────
+    else if(cmd && strcmp(cmd->valuestring, "SET_DO_MODE") == 0)
+    {
+        cJSON *mode = cJSON_GetObjectItem(root, "mode");
+        if(mode)
+        {
+            EPROM_General.DoModeDetails.Do_Mode = (RtuDoMode_e)mode->valueint;
+            flag_flashUpdateEPROM_General = 1;
+            
+            // Apply mode immediately
+            apply_do_mode();
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────
+    // COMMAND: Configuration Update
+    // ─────────────────────────────────────────────────────────
+    else if(cmd && strcmp(cmd->valuestring, "CONFIG_UPDATE") == 0)
+    {
+        parse_configuration_json(root);
+        flag_flashUpdateEPROM_General = 1;
+    }
+    
+    // ─────────────────────────────────────────────────────────
+    // COMMAND: Request Data Sync
+    // ─────────────────────────────────────────────────────────
+    else if(cmd && strcmp(cmd->valuestring, "SYNC_REQUEST") == 0)
+    {
+        publish_full_status(client);
+    }
+    
+    cJSON_Delete(root);
+}
+6. DO Mode Control Logic
+File: gpio_DIDO.c or dedicated mode handler
+// ═══════════════════════════════════════════════════════════════════
+// DO MODE DECISION ENGINE
+// ═══════════════════════════════════════════════════════════════════
+
+void apply_do_mode(void)
+{
+    RtuDoMode_e current_mode = EPROM_General.DoModeDetails.Do_Mode;
+    
+    switch(current_mode)
+    {
+        // ─────────────────────────────────────────────────────
+        case RTU_DO_MODE_MANUAL:
+            // DO states are controlled directly by cloud commands
+            // No automatic action here
+            break;
+            
+        // ─────────────────────────────────────────────────────
+        case RTU_DO_MODE_PHOTO:
+            // Light sensor based - Check ambient light level
+            {
+                uint16_t light_level = read_adc_light_sensor();
+                if(light_level < LIGHT_THRESHOLD_ON)
+                {
+                    set_all_outputs(1);  // Turn ON lights (dark)
+                }
+                else if(light_level > LIGHT_THRESHOLD_OFF)
+                {
+                    set_all_outputs(0);  // Turn OFF lights (bright)
+                }
+            }
+            break;
+            
+        // ─────────────────────────────────────────────────────
+        case RTU_DO_MODE_AUTO:
+            // Schedule-based from EPROM_Schedule
+            {
+                struct tm current_time;
+                get_rtc_time(&current_time);
+                
+                check_schedule_and_apply(&current_time);
+            }
+            break;
+            
+        // ─────────────────────────────────────────────────────
+        case RTU_DO_MODE_ASTROTIME_GEO:
+            // Sunrise/Sunset calculation based on GPS coordinates
+            {
+                struct tm current_time;
+                get_rtc_time(&current_time);
+                
+                double lat = EPROM_General.Cust_Detail.Lattitude;
+                double lon = EPROM_General.Cust_Detail.Longitude;
+                
+                struct tm sunrise, sunset;
+                calculate_sun_times(lat, lon, &current_time, &sunrise, &sunset);
+                
+                if(is_after_sunset(&current_time, &sunset) || 
+                   is_before_sunrise(&current_time, &sunrise))
+                {
+                    set_all_outputs(1);  // Night - Lights ON
+                }
+                else
+                {
+                    set_all_outputs(0);  // Day - Lights OFF
+                }
+            }
+            break;
+            
+        // ─────────────────────────────────────────────────────
+        case RTU_DO_MODE_TWILIGHT_GEO:
+            // Civil twilight (slightly before sunset/after sunrise)
+            {
+                // Similar to ASTROTIME but with twilight offset
+                double twilight_offset = 30;  // 30 minutes
+                // ... calculation with offset
+            }
+            break;
+            
+        // ─────────────────────────────────────────────────────
+        case RTU_DO_MODE_LOCAL:
+            // Local panel schedule (overrides cloud)
+            {
+                check_local_schedule_and_apply();
+            }
+            break;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SCHEDULE CHECKER
+// ═══════════════════════════════════════════════════════════════════
+
+void check_schedule_and_apply(struct tm *now)
+{
+    int total_schedules = EPROM_Schedule.Total_No_Schedule;
+    
+    for(int i = 0; i < total_schedules && i < 85; i++)
+    {
+        struct Schedule_Data *sch = &EPROM_Schedule.Schedule[i];
+        
+        if(sch->Sch_En_Di == CONF_DISABLE)
+            continue;
+        
+        int now_minutes = now->tm_hour * 60 + now->tm_min;
+        int start_minutes = sch->Start_HH * 60 + sch->Start_Min;
+        int stop_minutes = sch->Stop_HH * 60 + sch->Stop_Min;
+        
+        // Handle overnight schedules (start > stop)
+        if(start_minutes > stop_minutes)
+        {
+            // Overnight: 22:00 - 06:00
+            if(now_minutes >= start_minutes || now_minutes < stop_minutes)
+            {
+                set_all_outputs(1);  // Within schedule - ON
+                return;
+            }
+        }
+        else
+        {
+            // Normal: 18:00 - 22:00
+            if(now_minutes >= start_minutes && now_minutes < stop_minutes)
+            {
+                set_all_outputs(1);  // Within schedule - ON
+                return;
+            }
+        }
+    }
+    
+    // No active schedule - turn OFF
+    set_all_outputs(0);
+}
+
+7. I2C RTC & LCD Control
+File: I2C_RTC_LCD.c
+// ═══════════════════════════════════════════════════════════════════
+// I2C BUS CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════
+// I2C1 → RTC (DS3231 or similar)
+// I2C2 → LCD Display (PCF8574 I2C expander)
+
+static ql_task_t i2c_task = NULL;
+
+void ql_i2c_RTC_LCD_init(void)
+{
+    // Initialize I2C buses
+    ql_i2c_init(QL_I2C_PORT_1, QL_I2C_STANDARD_MODE);  // 100kHz
+    ql_i2c_init(QL_I2C_PORT_2, QL_I2C_STANDARD_MODE);
+    
+    // Initialize RTC
+    rtc_init();
+    
+    // Initialize LCD
+    lcd_init();
+    
+    // Create task
+    ql_rtos_task_create(&i2c_task,
+                        4096,
+                        APP_PRIORITY_NORMAL,
+                        "i2c_rtc_lcd",
+                        i2c_rtc_lcd_thread,
+                        NULL);
+}
+
+static void i2c_rtc_lcd_thread(void *param)
+{
+    struct tm rtc_time;
+    char lcd_line1[17], lcd_line2[17];
+    
+    while(1)
+    {
+        // ─────────────────────────────────────────────────────
+        // READ RTC TIME
+        // ─────────────────────────────────────────────────────
+        rtc_read_time(&rtc_time);
+        
+        // Sync system time with RTC periodically
+        static uint32_t last_sync = 0;
+        if(get_tick_ms() - last_sync > 60000)  // Every minute
+        {
+            ql_rtc_set_time(&rtc_time);
+            last_sync = get_tick_ms();
+        }
+        
+        // ─────────────────────────────────────────────────────
+        // UPDATE LCD DISPLAY
+        // ─────────────────────────────────────────────────────
+        // Line 1: Date and Time
+        snprintf(lcd_line1, sizeof(lcd_line1), 
+                 "%02d/%02d %02d:%02d:%02d",
+                 rtc_time.tm_mday, rtc_time.tm_mon + 1,
+                 rtc_time.tm_hour, rtc_time.tm_min, rtc_time.tm_sec);
+        
+        // Line 2: Status
+        snprintf(lcd_line2, sizeof(lcd_line2),
+                 "DO:%d%d%d DI:%d%d%d%d%d%d",
+                 EPROM_General.AI_DI_DO_Detail.DOSignal[0],
+                 EPROM_General.AI_DI_DO_Detail.DOSignal[1],
+                 EPROM_General.AI_DI_DO_Detail.DOSignal[2],
+                 EPROM_General.AI_DI_DO_Detail.dig_bit_array[0],
+                 EPROM_General.AI_DI_DO_Detail.dig_bit_array[1],
+                 EPROM_General.AI_DI_DO_Detail.dig_bit_array[2],
+                 EPROM_General.AI_DI_DO_Detail.dig_bit_array[3],
+                 EPROM_General.AI_DI_DO_Detail.dig_bit_array[4],
+                 EPROM_General.AI_DI_DO_Detail.dig_bit_array[5]);
+        
+        lcd_set_cursor(0, 0);
+        lcd_print(lcd_line1);
+        lcd_set_cursor(1, 0);
+        lcd_print(lcd_line2);
+        
+        // ─────────────────────────────────────────────────────
+        // TRIGGER DO MODE CHECK (for Astro/Schedule modes)
+        // ─────────────────────────────────────────────────────
+        static uint8_t last_minute = 0xFF;
+        if(rtc_time.tm_min != last_minute)
+        {
+            last_minute = rtc_time.tm_min;
+            apply_do_mode();  // Check schedules every minute
+        }
+        
+        ql_rtos_task_sleep_ms(1000);  // Update every second
+    }
+}
+
+8. External Flash Storage
+File: spi_flash_at25ff.c
+// ═══════════════════════════════════════════════════════════════════
+// SPI FLASH OPERATIONS
+// ═══════════════════════════════════════════════════════════════════
+
+void ql_spi_flash_init(void)
+{
+    // Initialize SPI bus
+    ql_spi_config_t spi_cfg = {
+        .port = QL_SPI_PORT_1,
+        .mode = QL_SPI_MODE_0,
+        .clk_freq = 10000000,  // 10MHz
+        .cs_pin = SPI_CS_PIN,
+    };
+    ql_spi_init(&spi_cfg);
+    
+    // Read flash ID to verify connection
+    uint32_t flash_id = flash_read_id();
+    if(flash_id != EXPECTED_FLASH_ID)
+    {
+        pro_Flash_State = 0;  // Flash error
+        return;
+    }
+    pro_Flash_State = 1;  // Flash OK
+    
+    // Load configuration from flash
+    ExtFlash_Read_EPROM_General(0);
+    ExtFlash_Read_EPROM_Schedule(0);
+    ExtFlash_Read_EPROM_PermanentData(0);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CONFIGURATION READ/WRITE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════
+
+void ExtFlash_Read_EPROM_General(unsigned char makeDefault)
+{
+    uint8_t buffer[sizeof(struct Save_Para_General)];
+    
+    // Read from flash
+    flash_read(EPROM_GENERAL_START_ADDRESS, buffer, sizeof(buffer));
+    
+    // Validate checksum
+    struct Save_Para_General *temp = (struct Save_Para_General *)buffer;
+    
+    if(temp->checkbyte != 0xAA || 
+       temp->SizeOfStuct != sizeof(struct Save_Para_General) ||
+       calculate_checksum(buffer, sizeof(buffer)) != temp->ChecksumOfStuct ||
+       makeDefault)
+    {
+        // Invalid or forced default - Initialize with defaults
+        init_default_general_config();
+        ExtFlash_update_EPROM_General();
+    }
+    else
+    {
+        // Valid - Copy to RAM
+        memcpy(&EPROM_General, buffer, sizeof(EPROM_General));
+    }
+    
+    // Sync with runtime variables
+    syncExtFlashVariableWithPCBPLCVariable();
+}
+
+void ExtFlash_update_EPROM_General(void)
+{
+    // Update header
+    EPROM_General.checkbyte = 0xAA;
+    EPROM_General.SizeOfStuct = sizeof(struct Save_Para_General);
+    EPROM_General.ChecksumOfStuct = calculate_checksum(
+        (uint8_t*)&EPROM_General, sizeof(EPROM_General) - 1);
+    
+    // Erase sector
+    flash_erase_sector(EPROM_GENERAL_START_ADDRESS);
+    
+    // Write data
+    flash_write(EPROM_GENERAL_START_ADDRESS, 
+                (uint8_t*)&EPROM_General, 
+                sizeof(EPROM_General));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// HISTORY DATA LOGGING
+// ═══════════════════════════════════════════════════════════════════
+
+void save_history_data(history_packet_t *packet)
+{
+    static uint32_t write_index = 0;
+    
+    uint32_t address = HISTORY_DATA_FILE_START_ADDRESS + 
+                       (write_index * sizeof(history_packet_t));
+    
+    if(address + sizeof(history_packet_t) > HISTORY_DATA_FILE_END_ADDRESS)
+    {
+        // Wrap around - erase and start over
+        write_index = 0;
+        address = HISTORY_DATA_FILE_START_ADDRESS;
+        // Consider erasing in background...
+    }
+    
+    flash_write(address, (uint8_t*)packet, sizeof(history_packet_t));
+    write_index++;
+}
+
+9. Complete System Flow Diagram
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              POWER ON                                         │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  appimg_enter() [ql_init.c]                                                  │
+│  ├── prvInvokeGlobalCtors()                                                  │
+│  ├── ql_dev_cfg_wdt()                                                        │
+│  ├── ql_pin_cfg_init()                                                       │
+│  └── Create Task: ql_init_demo_thread()                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  ql_init_demo_thread() [ql_init.c]                                           │
+│  ├── ql_i2c_RTC_LCD_init()      ─────────────────────────────────┐           │
+│  ├── ql_ledcfg_app_init()                                        │           │
+│  ├── ql_gpio_app_dido_init()    ─────────────────────────────────┼───┐       │
+│  ├── ql_gpioint_app_key_init()                                   │   │       │
+│  ├── ql_nw_app_init()                                            │   │       │
+│  ├── ql_datacall_app_init()                                      │   │       │
+│  ├── ql_power_app_init()                                         │   │       │
+│  └── ql_mqtt_app_init()         ─────────────────────────────────┼───┼───┐   │
+└──────────────────────────────────────────────────────────────────┼───┼───┼───┘
+                                                                   │   │   │
+                    ┌──────────────────────────────────────────────┘   │   │
+                    ▼                                                  │   │
+┌───────────────────────────────────┐                                  │   │
+│  I2C_RTC_LCD Task [I2C_RTC_LCD.c] │                                  │   │
+│  ├── Read RTC Time                │◄─────────────────────────────────┼───┤
+│  ├── Update LCD Display           │                                  │   │
+│  └── Trigger apply_do_mode()      │──────────────────────────────────┼───┤
+│      every minute                 │                                  │   │
+└───────────────────────────────────┘                                  │   │
+                                                                       │   │
+                    ┌──────────────────────────────────────────────────┘   │
+                    ▼                                                      │
+┌───────────────────────────────────┐                                      │
+│  GPIO_DIDO Task [gpio_DIDO.c]     │                                      │
+│  ├── Read Digital Inputs (DI)     │                                      │
+│  ├── Set Digital Outputs (DO)     │◄─────────────────────────────────────┤
+│  │   (Street Light Relays)        │                                      │
+│  └── apply_do_mode()              │                                      │
+│      ├── MANUAL: Cloud control    │◄─────────────────────────────────────┤
+│      ├── PHOTO: Light sensor      │                                      │
+│      ├── AUTO: Schedule-based     │                                      │
+│      ├── ASTRO: Sunrise/Sunset    │                                      │
+│      ├── TWILIGHT: Twilight calc  │                                      │
+│      └── LOCAL: Local schedule    │                                      │
+└───────────────────────────────────┘                                      │
+                    │                                                      │
+                    │ State Changes                                        │
+                    ▼                                                      │
+┌───────────────────────────────────┐                                      │
+│  SPI_Flash [spi_flash_at25ff.c]   │                                      │
+│  ├── Save EPROM_General           │                                      │
+│  ├── Save EPROM_Schedule          │                                      │
+│  └── Log History Data             │                                      │
+└───────────────────────────────────┘                                      │
+                                                                           │
+                    ┌──────────────────────────────────────────────────────┘
+                    ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│  MQTT Task [mqtt_demo.c]                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  STATE MACHINE                                                      │  │
+│  │  ├── WAIT_NETWORK: Wait for SIM registration                        │  │
+│  │  ├── WAIT_DATACALL: Activate PDP context                            │  │
+│  │  ├── CONNECTING: Connect to broker (14.102.161.101:1883)            │  │
+│  │  ├── SUBSCRIBING: Subscribe to command topic                        │  │
+│  │  └── RUNNING: Main loop                                             │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  RUNNING LOOP                                                       │  │
+│  │  ├── mqtt_client_yield() - Process incoming messages                │  │
+│  │  ├── Publish telemetry (every LogRate seconds)                      │  │
+│  │  └── Publish on DO/DI state change                                  │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  MESSAGE HANDLER (mqtt_message_callback)                            │  │
+│  │  ├── DO_CONTROL: Set street light ON/OFF                            │  │
+│  │  ├── SET_DO_MODE: Change control mode                               │  │
+│  │  ├── CONFIG_UPDATE: Update configuration                            │  │
+│  │  └── SYNC_REQUEST: Send full status                                 │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│                           CLOUD SERVER                                     │
+│  ├── Receives telemetry data                                              │
+│  ├── Sends control commands                                               │
+│  └── Sends configuration updates                                          │
+└───────────────────────────────────────────────────────────────────────────┘
+
+
+Summary Table
+File	Purpose	Key Functions
+ql_init.c	System entry & task creation	appimg_enter(), ql_init_demo_thread()
+configuration.h
+Data structures & defaults	Structs, enums, memory addresses
+configuration.c	Flash read/write	ExtFlash_Read/Update_*()
+gpio_DIDO.c	Street light relay control	set_digital_output(), apply_do_mode()
+gpio_int_KEY.c	Physical button handling	Key interrupt callbacks
+I2C_RTC_LCD.c	RTC time & LCD display	rtc_read_time(), lcd_print()
+mqtt_demo.c	Cloud communication	mqtt_message_callback(), publish_*()
+spi_flash_at25ff.c	Persistent storage	flash_read(), flash_write()
+rs485_METER.c	Energy meter reading	Modbus communication
+cJSON.c	JSON parsing	cJSON_Parse(), cJSON_GetObjectItem()
+
+
+
